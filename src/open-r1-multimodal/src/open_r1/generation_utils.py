@@ -3169,6 +3169,7 @@ class GenerationMixin:
         generation_config: GenerationConfig,
         synced_gpus: bool,
         streamer: Optional["BaseStreamer"],
+        dyco_enabled: bool = True,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         """DyCo-RL _sample: multinomial sampling with FR-based scoring."""

@@ -322,7 +322,7 @@ def qwen2_5vl_model_forward(
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        if self.gradient_checkpointing and self.training:
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
             if use_cache:
                 logger.warning_once(
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
@@ -371,7 +371,7 @@ def qwen2_5vl_model_forward(
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
                     hidden_states,
