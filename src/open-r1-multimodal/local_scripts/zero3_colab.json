@@ -1,4 +1,4 @@
-cfg = {
+{
     "bf16": {"enabled": "auto"},
     "fp16": {"enabled": "auto"},
     "optimizer": {
@@ -9,21 +9,20 @@ cfg = {
         "stage": 3,
         "offload_optimizer": {"device": "none"},
         "offload_param": {"device": "none"},
-        "overlap_comm": True,
-        "contiguous_gradients": True,
+        "overlap_comm": true,
+        "contiguous_gradients": true,
         "sub_group_size": 1e9,
         "reduce_bucket_size": "auto",
         "stage3_prefetch_bucket_size": "auto",
         "stage3_param_persistence_threshold": "auto",
         "stage3_max_live_parameters": 1e9,
         "stage3_max_reuse_distance": 1e9,
-        "stage3_gather_16bit_weights_on_model_save": True
+        "stage3_gather_16bit_weights_on_model_save": true
     },
     "gradient_accumulation_steps": "auto",
     "gradient_clipping": "auto",
     "train_batch_size": "auto",
     "train_micro_batch_size_per_gpu": "auto",
     "steps_per_print": 100,
-    "wall_clock_breakdown": False
+    "wall_clock_breakdown": false
 }
-json.dump(cfg, open("/content/ds_zero3_colab.json", "w"), indent=2)
