@@ -411,6 +411,7 @@ class GRPOConfig(TrainingArguments):
             "(encourages low entropy / confident predictions). Active only when perception_loss_weight > 0."
         },
     )
+    
     der_loss_weight2: float = field(
         default=0.03,
         metadata={
@@ -425,5 +426,13 @@ class GRPOConfig(TrainingArguments):
         metadata={
             "help": "Whether to log a sample of (prompt, completion) pairs every `logging_steps` steps. If `rich` is "
             "installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`."
+        },
+    )
+
+    # Parameters that control dyco is enabled
+    dyco_reweighting: bool = field(
+        default=True,
+        metadata={
+            "help": "Apply DyCo-RL sample-score reweighting to GRPO advantages."
         },
     )

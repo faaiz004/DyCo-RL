@@ -329,7 +329,7 @@ class VLMGRPOTrainer(Trainer):
         self.vlm_module.post_model_init(model, processing_class)
         self.vlm_module.post_model_init(self.ref_model, processing_class)
 
-        # Reward functions
+        # Reward functions (Where are the reward functions loaded?)
         if not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
         for i, reward_func in enumerate(reward_funcs):
@@ -364,7 +364,7 @@ class VLMGRPOTrainer(Trainer):
         def data_collator(features):  # No data collation is needed in GRPO
             return features
 
-        # Training arguments
+        # Training arguments (I will manipulate these using arguments to create a standard run across different RL algorithms)
         self.max_prompt_length = args.max_prompt_length
         self.max_prompt_length = None
         if args.max_prompt_length is not None:
@@ -385,6 +385,8 @@ class VLMGRPOTrainer(Trainer):
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
         # DAPO knobs
         self.loss_type = getattr(args, "loss_type", "grpo")
+        # DyCo-RL knobs
+        self.dyco_reweighting = getattr(args, "dyco_reweighting", True)
         self.importance_sampling_level = getattr(args, "importance_sampling_level", "token")
         self.mask_truncated_completions = getattr(args, "mask_truncated_completions", False)
         # SAPO knobs
@@ -578,7 +580,7 @@ class VLMGRPOTrainer(Trainer):
                         else:
                             new_h = 28
                             new_w = int(w * (28/h))
-                    img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
+                        img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
                 except:
                     pass
                 images.append(img)
@@ -1075,22 +1077,24 @@ class VLMGRPOTrainer(Trainer):
         # Get the advantages from inputs
         advantages = inputs["advantages"]
 
-        # === [DyCo-RL] Advantage reweight using sample_score ===
-        # Score from generate → _sample: [B], in [-1, 1]
-        sample_score = inputs["sample_score"].to(advantages.dtype)  # [B]
+        if self.dyco_reweighting:
 
-        # Length penalty: too-short completions get minimum score to prevent collapse
-        comp_lengths = completion_mask.sum(dim=1).float()  # [B]
-        num_params = sum(p.numel() for p in model.parameters())
-        min_comp_len = 150 if num_params > 5e9 else 60  # 7B vs 3B
-        short_mask = comp_lengths < min_comp_len
-        sample_score = torch.where(short_mask, torch.full_like(sample_score, -1.0), sample_score)
+            # === [DyCo-RL] Advantage reweight using sample_score ===
+            # Score from generate → _sample: [B], in [-1, 1]
+            sample_score = inputs["sample_score"].to(advantages.dtype)  # [B]
 
-        dyco_alpha = 0.2
-        sample_weight = (1.0 + dyco_alpha * sample_score).clamp(0.8, 1.2)
-        if self.state.global_step % 50 == 0:
-            print(f"[DyCo-RL] Reweight step={self.state.global_step}: α=0.2, score_mean={sample_score.mean().item():.4f}, weight=[{sample_weight.min().item():.4f}, {sample_weight.max().item():.4f}]")
-        advantages = advantages * sample_weight
+            # Length penalty: too-short completions get minimum score to prevent collapse
+            comp_lengths = completion_mask.sum(dim=1).float()  # [B]
+            num_params = sum(p.numel() for p in model.parameters())
+            min_comp_len = 150 if num_params > 5e9 else 60  # 7B vs 3B
+            short_mask = comp_lengths < min_comp_len
+            sample_score = torch.where(short_mask, torch.full_like(sample_score, -1.0), sample_score)
+
+            dyco_alpha = 0.2
+            sample_weight = (1.0 + dyco_alpha * sample_score).clamp(0.8, 1.2)
+            if self.state.global_step % 50 == 0:
+                print(f"[DyCo-RL] Reweight step={self.state.global_step}: α=0.2, score_mean={sample_score.mean().item():.4f}, weight=[{sample_weight.min().item():.4f}, {sample_weight.max().item():.4f}]")
+            advantages = advantages * sample_weight
 
         # SAPO length regularization
         if self.loss_type == "sapo":
