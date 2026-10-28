@@ -110,7 +110,7 @@ import difflib
 import numpy as np
 import re
 
-_model = SentenceTransformer('/volume/med-train/users/shuyan/lhg/model/all-MiniLM-L6-v2')
+_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 def evaluate_answer_similarity(student_answer, ground_truth):
     
