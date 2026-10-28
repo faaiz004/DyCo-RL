@@ -367,6 +367,9 @@ def qwen2_5vl_model_forward(
         text_ratio=None
         img_attn=None
         text_attn=None
+        # let the patched attention skip the manual attention-weight computation in normal mode
+        for decoder_layer in self.layers:
+            decoder_layer.self_attn._dyco_enabled = dyco_enabled
         for idx,decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -494,21 +497,15 @@ def flash_attn_forward(
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
     
-    #add attn_weight
-    
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-    if query_states.dtype == torch.float16:
-        attn_weights = torch.where(torch.isinf(attn_weights), torch.zeros_like(attn_weights), attn_weights)
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+    #add attn_weight (only needed by DyCo; skipped in normal mode)
+    attn_weights = None
+    if getattr(self, "_dyco_enabled", True):
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if query_states.dtype == torch.float16:
+            attn_weights = torch.where(torch.isinf(attn_weights), torch.zeros_like(attn_weights), attn_weights)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
     dropout_rate = 0.0 if not self.training else self.attention_dropout
-    #print(attn_weights.shape)
-    #reallocate
-    attn=attn_weights.mean(dim=(0, 1, 2))
-    B, H, T, D = value_states.shape
-    img_start, img_end = img_token_idx, qs_token_idx
-    img_attn = attn[img_start:img_end] 
-    img_len = img_end - img_start
 
 
     

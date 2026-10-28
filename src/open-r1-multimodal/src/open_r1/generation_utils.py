@@ -2230,6 +2230,7 @@ class GenerationMixin:
                 generation_config=generation_config,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
+                dyco_enabled=dyco_enabled,
                 **model_kwargs,
             )
 

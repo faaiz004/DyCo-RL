@@ -387,6 +387,12 @@ class VLMGRPOTrainer(Trainer):
         self.loss_type = getattr(args, "loss_type", "grpo")
         # DyCo-RL knobs
         self.dyco_reweighting = getattr(args, "dyco_reweighting", True)
+        # Tell the patched Qwen forward/attention whether to compute DyCo attention weights,
+        # so loss/ref forward passes also skip them in normal mode (not just generation).
+        for m in (model, self.ref_model):
+            if m is not None:
+                for sub in m.modules():
+                    sub._dyco_enabled = self.dyco_reweighting
         self.importance_sampling_level = getattr(args, "importance_sampling_level", "token")
         self.mask_truncated_completions = getattr(args, "mask_truncated_completions", False)
         # SAPO knobs
