@@ -419,7 +419,8 @@ def qwen2_5vl_model_forward(
             hidden_states = layer_outputs[0]
             
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                # decoder_forward always returns (hidden, attn_weights, cache)
+                next_decoder_cache = layer_outputs[2]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
