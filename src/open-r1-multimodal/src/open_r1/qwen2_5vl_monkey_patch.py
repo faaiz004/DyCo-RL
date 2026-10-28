@@ -71,7 +71,7 @@ def qwen2_5vl_forward(
         img_token_idx:Optional[int] = 0,
         qs_token_idx:Optional[int] = 0,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
-        dyco_enabled = getattr(self, "_dyco_enabled", True)
+        dyco_enabled = getattr(self.model, "_dyco_enabled", True)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         if not dyco_enabled:
             output_attentions = False
@@ -309,7 +309,7 @@ def qwen2_5vl_model_forward(
         img_token_idx:Optional[int] = 0,
         qs_token_idx:Optional[int] = 0,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        
+        dyco_enabled = getattr(self, "_dyco_enabled", True)
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
