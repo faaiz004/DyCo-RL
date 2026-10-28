@@ -636,6 +636,7 @@ class VLMGRPOTrainer(Trainer):
                 generation_config=self.generation_config,
                 img_token_idx=img_token_idx,
                 qs_token_idx=qs_token_idx,
+                dyco_enabled=self.dyco_reweighting,
             )
             #print(img_ratio)
             

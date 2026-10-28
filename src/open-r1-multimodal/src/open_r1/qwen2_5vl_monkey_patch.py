@@ -71,7 +71,10 @@ def qwen2_5vl_forward(
         img_token_idx:Optional[int] = 0,
         qs_token_idx:Optional[int] = 0,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
+        dyco_enabled = getattr(self, "_dyco_enabled", True)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        if not dyco_enabled:
+            output_attentions = False
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -393,7 +396,7 @@ def qwen2_5vl_model_forward(
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                 )
-            if idx == len(self.layers) - 1 and qs_token_idx!=0 and qs_token_idx is not None:
+            if dyco_enabled and idx == len(self.layers) - 1 and qs_token_idx!=0 and qs_token_idx is not None:
                 attn = layer_outputs[1]
                 attn = attn.mean(dim=(1, 2))  # [batch, seq_len]
                 attn = attn.clamp(min=0)
@@ -624,4 +627,3 @@ def decoder_forward(
         return outputs
 def monkey_patch_qwen2_5vl_decoder_forward():
     Qwen2_5_VLDecoderLayer.forward = decoder_forward
-

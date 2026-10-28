@@ -1888,6 +1888,7 @@ class GenerationMixin:
         streamer: Optional["BaseStreamer"] = None,
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
+        dyco_enabled: bool = True,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         r"""
@@ -2173,6 +2174,7 @@ class GenerationMixin:
                 generation_config=generation_config,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
+                dyco_enabled=dyco_enabled,
                 **model_kwargs,
             )
         elif generation_mode == GenerationMode.DOLA_GENERATION:
@@ -2709,6 +2711,7 @@ class GenerationMixin:
         generation_config: GenerationConfig,
         synced_gpus: bool,
         streamer: Optional["BaseStreamer"],
+        dyco_enabled: bool = True,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         r"""
@@ -3207,6 +3210,11 @@ class GenerationMixin:
                 os.environ["TOKENIZERS_PARALLELISM"] = "0"
                 model_forward = self.get_compiled_call(generation_config.compile_config)
 
+        # Disable DyCo-only attention extraction in the patched Qwen forward pass.
+        dyco_model = getattr(self, "model", self)
+        previous_dyco_enabled = getattr(dyco_model, "_dyco_enabled", True)
+        dyco_model._dyco_enabled = dyco_enabled
+
         # DyCo-RL state
         is_prefill = True
         prev_img_attn = None
@@ -3275,52 +3283,56 @@ class GenerationMixin:
             this_peer_finished = unfinished_sequences.max() == 0
             cur_len += 1
 
-            # [DyCo-RL] Collect attention signals per decode step
-            _img_ratio = getattr(outputs, 'img_ratio', None)
-            _text_ratio = getattr(outputs, 'text_ratio', None)
-            if _img_ratio is not None:
-                img_ratio_list.append(_img_ratio)
-                text_ratio_list.append(_text_ratio)
+            if dyco_enabled:
+                # [DyCo-RL] Collect attention signals per decode step
+                _img_ratio = getattr(outputs, 'img_ratio', None)
+                _text_ratio = getattr(outputs, 'text_ratio', None)
+                if _img_ratio is not None:
+                    img_ratio_list.append(_img_ratio)
+                    text_ratio_list.append(_text_ratio)
 
-            # Adjacent FR: FR(prev_attn, cur_attn)
-            cur_img_attn = getattr(outputs, 'img_attn', None)
-            cur_text_attn = getattr(outputs, 'text_attn', None)
-            if prev_img_attn is not None and cur_img_attn is not None:
-                L_txt = min(prev_text_attn.shape[1], cur_text_attn.shape[1])
-                _, fr_i = self._batched_M_FR(prev_img_attn, cur_img_attn)
-                _, fr_t = self._batched_M_FR(prev_text_attn[:, :L_txt], cur_text_attn[:, :L_txt])
-                FR_img_list.append(fr_i)
-                FR_txt_list.append(fr_t)
-            prev_img_attn = cur_img_attn.detach() if cur_img_attn is not None else None
-            prev_text_attn = cur_text_attn.detach() if cur_text_attn is not None else None
+                # Adjacent FR: FR(prev_attn, cur_attn)
+                cur_img_attn = getattr(outputs, 'img_attn', None)
+                cur_text_attn = getattr(outputs, 'text_attn', None)
+                if prev_img_attn is not None and cur_img_attn is not None:
+                    L_txt = min(prev_text_attn.shape[1], cur_text_attn.shape[1])
+                    _, fr_i = self._batched_M_FR(prev_img_attn, cur_img_attn)
+                    _, fr_t = self._batched_M_FR(prev_text_attn[:, :L_txt], cur_text_attn[:, :L_txt])
+                    FR_img_list.append(fr_i)
+                    FR_txt_list.append(fr_t)
+                prev_img_attn = cur_img_attn.detach() if cur_img_attn is not None else None
+                prev_text_attn = cur_text_attn.detach() if cur_text_attn is not None else None
 
             del outputs
         # ======== end decode loop ========
 
-        # Guard: no attention signals (e.g. InternVL) → zero score
-        if len(img_ratio_list) == 0:
-            sample_score = torch.zeros(input_ids.shape[0], device=input_ids.device, dtype=torch.float32)
-            return input_ids, sample_score
-
         if streamer is not None:
             streamer.end()
+
+        # Guard: no attention signals (e.g. InternVL) → zero score
+        if not dyco_enabled or len(img_ratio_list) == 0:
+            sample_score = torch.zeros(input_ids.shape[0], device=input_ids.device, dtype=torch.float32)
+            dyco_model._dyco_enabled = previous_dyco_enabled
+            return input_ids, sample_score
 
         if return_dict_in_generate:
             zero_score = torch.zeros(input_ids.shape[0], device=input_ids.device)
             if self.config.is_encoder_decoder:
-                return GenerateEncoderDecoderOutput(
+                result = GenerateEncoderDecoderOutput(
                     sequences=input_ids, scores=scores, logits=raw_logits,
                     encoder_attentions=encoder_attentions, encoder_hidden_states=encoder_hidden_states,
                     decoder_attentions=decoder_attentions, cross_attentions=cross_attentions,
                     decoder_hidden_states=decoder_hidden_states,
                     past_key_values=model_kwargs.get("past_key_values"),
-                ), zero_score
+                )
             else:
-                return GenerateDecoderOnlyOutput(
+                result = GenerateDecoderOnlyOutput(
                     sequences=input_ids, scores=scores, logits=raw_logits,
                     attentions=decoder_attentions, hidden_states=decoder_hidden_states,
                     past_key_values=model_kwargs.get("past_key_values"),
-                ), zero_score
+                )
+            dyco_model._dyco_enabled = previous_dyco_enabled
+            return result, zero_score
         else:
             # === [DyCo-RL] Eq 6-9: FR classification + alignment score ===
             sample_score = torch.zeros(input_ids.shape[0], device=input_ids.device, dtype=torch.float32)
@@ -3387,6 +3399,7 @@ class GenerationMixin:
                 else:
                     sample_score = torch.zeros_like(sample_score)
 
+            dyco_model._dyco_enabled = previous_dyco_enabled
             return input_ids, sample_score
 
     def _temporary_reorder_cache(self, past_key_values, beam_idx):
