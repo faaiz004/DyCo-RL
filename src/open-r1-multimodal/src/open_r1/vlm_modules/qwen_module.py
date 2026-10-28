@@ -98,10 +98,10 @@ def parse_last_bbox(text):
         pass
     return None
 
-client = OpenAI(
-    api_key=os.getenv(""),
-    base_url=os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
-)
+# client = OpenAI(
+#     api_key=os.getenv(""),
+#     base_url=os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
+# )
 
 
 
