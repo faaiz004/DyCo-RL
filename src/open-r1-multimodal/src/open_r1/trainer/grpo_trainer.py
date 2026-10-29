@@ -15,6 +15,7 @@
 import os
 import textwrap
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Any, Callable, Optional, Union, Sized
 
 import torch
@@ -479,6 +480,84 @@ class VLMGRPOTrainer(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
+        # vLLM rollouts (colocated): each training process runs its own engine on its own GPU
+        if args.use_vllm:
+            if self.dyco_reweighting:
+                raise ValueError(
+                    "use_vllm is not compatible with dyco_reweighting: DyCo scores need the attention weights from "
+                    "HF generate. Pass --dyco_reweighting false."
+                )
+            os.environ["VLLM_USE_V1"] = "0"  # V0 exposes the model object directly, which the weight sync needs
+            from vllm import LLM, SamplingParams
+
+            image_processor = getattr(processing_class, "image_processor", processing_class)
+            self.llm = LLM(
+                model=model_id,
+                tensor_parallel_size=1,
+                distributed_executor_backend="external_launcher",
+                gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                max_model_len=args.vllm_max_model_len,
+                max_num_seqs=args.per_device_train_batch_size,
+                dtype=args.vllm_dtype,
+                # Resize images exactly like the HF processor does, so the model sees the same image
+                mm_processor_kwargs={
+                    "max_pixels": image_processor.max_pixels,
+                    "min_pixels": image_processor.min_pixels,
+                },
+                seed=args.seed + self.accelerator.process_index,
+            )
+            # Same sampling distribution as the HF path (GenerationConfig defaults: top_k=50, top_p=1.0)
+            self.sampling_params = SamplingParams(
+                n=1,
+                temperature=1.0,
+                top_k=50,
+                top_p=1.0,
+                max_tokens=self.max_completion_length,
+            )
+            self._last_vllm_loaded_step = -1
+
+    def _move_model_to_vllm(self):
+        """Copy the current policy weights into the colocated vLLM engine.
+
+        Under ZeRO-3 each module's parameters are gathered one module at a time, so the full model is never
+        materialised at once. Every process must call this together (the gather is a collective op).
+        """
+        llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        zero3 = is_deepspeed_zero3_enabled()
+        if zero3:
+            import deepspeed
+        for module_name, module in unwrapped_model.named_modules():
+            params = list(module.named_parameters(recurse=False))
+            if not params:
+                continue
+            gather_ctx = deepspeed.zero.GatheredParameters([p for _, p in params]) if zero3 else nullcontext()
+            with gather_ctx:
+                llm_model.load_weights(
+                    [(f"{module_name}.{name}" if module_name else name, p.data) for name, p in params]
+                )
+
+    def _generate_with_vllm(self, prompts_text, images, num_images_per_sample):
+        """Generate one completion per prompt with vLLM and return the right-padded completion ids."""
+        device = self.accelerator.device
+        requests = []
+        img_start = 0
+        for text, n_img in zip(prompts_text, num_images_per_sample):
+            sample_images = images[img_start:img_start + n_img]
+            img_start += n_img
+            request = {"prompt": text}
+            if n_img == 1:
+                request["multi_modal_data"] = {"image": sample_images[0]}
+            elif n_img > 1:
+                request["multi_modal_data"] = {"image": sample_images}
+            requests.append(request)
+
+        outputs = self.llm.generate(requests, sampling_params=self.sampling_params, use_tqdm=False)
+        completion_ids = [torch.tensor(out.outputs[0].token_ids, dtype=torch.long, device=device) for out in outputs]
+        return torch.nn.utils.rnn.pad_sequence(
+            completion_ids, batch_first=True, padding_value=self.processing_class.pad_token_id
+        )
+
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
         # Ensure use_cache is disabled
@@ -636,26 +715,36 @@ class VLMGRPOTrainer(Trainer):
         img_token_idx = idx[1][0].item()  # 第一个出现的 token 索引
         qs_token_idx = idx[1][-1].item()  # 最后一个出现的 token 索引
         # Generate completions
-        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-            generate_returned_result, sample_score = unwrapped_model.generate(
-                **{k: v for k, v in prompt_inputs.items() if k not in self.vlm_module.get_non_generate_params()}, 
-                generation_config=self.generation_config,
-                img_token_idx=img_token_idx,
-                qs_token_idx=qs_token_idx,
-                dyco_enabled=self.dyco_reweighting,
-            )
-            #print(img_ratio)
-            
+        if self.args.use_vllm:
+            # Sync the latest policy weights into vLLM once per optimizer step, so rollouts stay on-policy
+            if self.state.global_step != self._last_vllm_loaded_step:
+                self._move_model_to_vllm()
+                self._last_vllm_loaded_step = self.state.global_step
+            completion_ids = self._generate_with_vllm(prompts_text, images, num_images_per_sample)
             prompt_length = prompt_ids.size(1)
-            if not self.vlm_module.is_embeds_input():
-                prompt_completion_ids = generate_returned_result
-                prompt_ids = prompt_completion_ids[:, :prompt_length]
-                completion_ids = prompt_completion_ids[:, prompt_length:]
-            else:
-                # In this case, the input of the LLM backbone is the embedding of the combination of the image and text prompt
-                # So the returned result of the `generate` method only contains the completion ids
-                completion_ids = generate_returned_result
-                prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            sample_score = None  # DyCo scores need HF generate; zeros are filled in below
+        else:
+            with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                generate_returned_result, sample_score = unwrapped_model.generate(
+                    **{k: v for k, v in prompt_inputs.items() if k not in self.vlm_module.get_non_generate_params()}, 
+                    generation_config=self.generation_config,
+                    img_token_idx=img_token_idx,
+                    qs_token_idx=qs_token_idx,
+                    dyco_enabled=self.dyco_reweighting,
+                )
+                #print(img_ratio)
+            
+                prompt_length = prompt_ids.size(1)
+                if not self.vlm_module.is_embeds_input():
+                    prompt_completion_ids = generate_returned_result
+                    prompt_ids = prompt_completion_ids[:, :prompt_length]
+                    completion_ids = prompt_completion_ids[:, prompt_length:]
+                else:
+                    # In this case, the input of the LLM backbone is the embedding of the combination of the image and text prompt
+                    # So the returned result of the `generate` method only contains the completion ids
+                    completion_ids = generate_returned_result
+                    prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
