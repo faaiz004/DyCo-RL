@@ -640,6 +640,7 @@ class VLMGRPOTrainer(Trainer):
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = self.vlm_module.prepare_prompt(self.processing_class, inputs)
+        vllm_prompts_text = list(prompts_text)  # copy before the HF processor expands <|image_pad|> in place
         # Handle both pre-loaded images and image paths
         images = []
         num_images_per_sample = []
@@ -720,7 +721,7 @@ class VLMGRPOTrainer(Trainer):
             if self.state.global_step != self._last_vllm_loaded_step:
                 self._move_model_to_vllm()
                 self._last_vllm_loaded_step = self.state.global_step
-            completion_ids = self._generate_with_vllm(prompts_text, images, num_images_per_sample)
+            completion_ids = self._generate_with_vllm(vllm_prompts_text, images, num_images_per_sample)
             prompt_length = prompt_ids.size(1)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
             sample_score = None  # DyCo scores need HF generate; zeros are filled in below
