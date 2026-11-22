@@ -409,6 +409,15 @@ class VLMGRPOTrainer(Trainer):
         self.mask_type = getattr(args, "mask_type", "random")
         self.der_loss_weight1 = getattr(args, "der_loss_weight1", 0.03)
         self.der_loss_weight2 = getattr(args, "der_loss_weight2", 0.03)
+        self.papo_mask_raw_image = getattr(args, "papo_mask_raw_image", False)
+        self.papo_mask_patch_size = getattr(args, "papo_mask_patch_size", 14)
+        self.papo_precompute_mask_logps = getattr(args, "papo_precompute_mask_logps", False)
+        self.papo_kl_clipping = getattr(args, "papo_kl_clipping", True)
+        self.papo_kl_clip_max = getattr(args, "papo_kl_clip_max", 0.2)
+        self.papo_token_mean = getattr(args, "papo_token_mean", False)
+        self.papo_entropy_estimator = getattr(args, "papo_entropy_estimator", "full")
+        if self.papo_entropy_estimator not in ("full", "sampled"):
+            raise ValueError(f"papo_entropy_estimator must be 'full' or 'sampled', got {self.papo_entropy_estimator!r}")
 
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
@@ -641,6 +650,7 @@ class VLMGRPOTrainer(Trainer):
         prompts = [x["prompt"] for x in inputs]
         prompts_text = self.vlm_module.prepare_prompt(self.processing_class, inputs)
         vllm_prompts_text = list(prompts_text)  # copy before the HF processor expands <|image_pad|> in place
+        papo_prompts_text = list(prompts_text)  # unexpanded copy for re-processing PAPO's masked images
         # Handle both pre-loaded images and image paths
         images = []
         num_images_per_sample = []
@@ -768,7 +778,52 @@ class VLMGRPOTrainer(Trainer):
         # Get the multimodal inputs
         multimodal_keywords = self.vlm_module.get_custom_multimodal_keywords()
         multimodal_inputs = {k: prompt_inputs[k] if k in prompt_inputs else None for k in multimodal_keywords}
+
+        # PAPO: build the masked-image inputs here when the mask must be shared across a prompt's rollouts
+        # (raw-image masking) or when its log-probs are precomputed once without gradients.
+        masked_multimodal_inputs = None
+        papo_on = self.perception_loss_weight > 0
+        if papo_on and multimodal_inputs.get("pixel_values") is not None:
+            if self.papo_mask_raw_image and len(images) > 0:
+                masked_images = [self._blacken_raw_image(img) for img in images]
+                masked_prompt_inputs, _ = self.vlm_module.prepare_model_inputs(
+                    self.processing_class,
+                    papo_prompts_text,
+                    masked_images,
+                    return_tensors="pt",
+                    padding=True,
+                    padding_side="left",
+                    add_special_tokens=False,
+                )
+                masked_pv = masked_prompt_inputs["pixel_values"].to(
+                    device=multimodal_inputs["pixel_values"].device, dtype=multimodal_inputs["pixel_values"].dtype
+                )
+                if masked_pv.shape != multimodal_inputs["pixel_values"].shape:
+                    raise RuntimeError(
+                        f"PAPO masked pixel_values shape {tuple(masked_pv.shape)} != original "
+                        f"{tuple(multimodal_inputs['pixel_values'].shape)}"
+                    )
+                masked_multimodal_inputs = dict(multimodal_inputs)
+                masked_multimodal_inputs["pixel_values"] = masked_pv
+            elif self.papo_precompute_mask_logps:
+                masked_multimodal_inputs = dict(multimodal_inputs)
+                masked_multimodal_inputs["pixel_values"] = self._mask_image(multimodal_inputs["pixel_values"])
+
+        mask_per_token_logps, mask_entropies = None, None
         with torch.no_grad():
+            if self.papo_precompute_mask_logps and masked_multimodal_inputs is not None:
+                if self.papo_entropy_estimator == "full" and self.der_loss_weight2 > 0:
+                    mask_per_token_logps, mask_entropies = self._get_per_token_logps_and_entropies(
+                        model, prompt_completion_ids, attention_mask, **masked_multimodal_inputs
+                    )
+                    mask_entropies = mask_entropies[:, prompt_length - 1:]
+                else:
+                    mask_per_token_logps = self._get_per_token_logps(
+                        model, prompt_completion_ids, attention_mask, **masked_multimodal_inputs
+                    )
+                mask_per_token_logps = mask_per_token_logps[:, prompt_length - 1:]
+                masked_multimodal_inputs = None  # no longer needed; free the masked pixels
+
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its
             # computation here, and use per_token_logps.detach() instead.
             if self.num_iterations > 1:
@@ -877,7 +932,10 @@ class VLMGRPOTrainer(Trainer):
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
             "sample_score": sample_score,
-            "multimodal_inputs": multimodal_inputs
+            "multimodal_inputs": multimodal_inputs,
+            "masked_multimodal_inputs": masked_multimodal_inputs,
+            "mask_per_token_logps": mask_per_token_logps,
+            "mask_entropies": mask_entropies,
         }
 
     # def _generate_and_score_completions(self, inputs: dict[str, Union[torch.Tensor, Any]], model) -> dict[str, Union[torch.Tensor, Any]]:
@@ -1160,7 +1218,8 @@ class VLMGRPOTrainer(Trainer):
 
         # Get the current policy's log probabilities (and entropy if PAPO is enabled)
         _papo_on = self.perception_loss_weight > 0
-        if _papo_on:
+        # Exact full-vocab entropy is only needed for the 'full' estimator with a non-zero original-image DER weight
+        if _papo_on and self.papo_entropy_estimator == "full" and self.der_loss_weight1 > 0:
             per_token_logps, orig_entropies = self._get_per_token_logps_and_entropies(
                 model, input_ids, attention_mask, **multimodal_inputs
             )
@@ -1272,34 +1331,89 @@ class VLMGRPOTrainer(Trainer):
         # === [AT-RL v38] WFR metrics (no loss penalty, using advantage reweight instead) ===
         # === [AT-RL v38] 结束 ===
 
-        # PAPO: implicit perception loss + double entropy regularization (matches
-        # trl.experimental.papo.papo_trainer.PAPOTrainer._compute_loss)
+        # PAPO: implicit perception loss + double entropy regularization. Default flags reproduce the original
+        # TRL-style version; the papo_* flags switch individual pieces to the official PAPO implementation.
         if _papo_on:
-            masked_mm = dict(multimodal_inputs) if multimodal_inputs is not None else {}
-            pv = masked_mm.get("pixel_values", None)
-            if pv is not None:
-                masked_mm["pixel_values"] = self._mask_image(pv)
-                mask_img_logps, mask_img_entropies = self._get_per_token_logps_and_entropies(
-                    model, input_ids, attention_mask, **masked_mm
-                )
-                mask_img_logps = mask_img_logps[:, prompt_ids.size(1) - 1:]
-                mask_img_entropies = mask_img_entropies[:, prompt_ids.size(1) - 1:]
-                perception_kl = (
-                    torch.exp(mask_img_logps - per_token_logps)
-                    - (mask_img_logps - per_token_logps)
-                    - 1
-                )
-                perception_kl = torch.clamp(perception_kl, min=0.0, max=0.2)
-                perception_loss = self.perception_loss_weight * perception_kl
-                der_loss = self.der_loss_weight1 * orig_entropies + self.der_loss_weight2 * mask_img_entropies
-                # TRL combines per-token tensors with the scalar GRPO/DAPO loss, then .mean()
-                loss = (loss - perception_loss + der_loss).mean()
+            prompt_len = prompt_ids.size(1)
+            full_entropy = self.papo_entropy_estimator == "full"
+            mask_img_logps, mask_img_entropies = None, None
+
+            if inputs.get("mask_per_token_logps") is not None:
+                # Precomputed once at generation time without gradients (official PAPO)
+                mask_img_logps = inputs["mask_per_token_logps"]
+                mask_img_entropies = inputs.get("mask_entropies")
+            else:
+                # Recompute with gradients. Use the raw-image mask built at generation time if there is one,
+                # otherwise draw a fresh mask on the processed pixel_values (original repo behaviour).
+                masked_mm = inputs.get("masked_multimodal_inputs")
+                if masked_mm is None and multimodal_inputs is not None and multimodal_inputs.get("pixel_values") is not None:
+                    masked_mm = dict(multimodal_inputs)
+                    masked_mm["pixel_values"] = self._mask_image(multimodal_inputs["pixel_values"])
+                if masked_mm is not None:
+                    if full_entropy and self.der_loss_weight2 > 0:
+                        mask_img_logps, mask_img_entropies = self._get_per_token_logps_and_entropies(
+                            model, input_ids, attention_mask, **masked_mm
+                        )
+                        mask_img_entropies = mask_img_entropies[:, prompt_len - 1:]
+                    else:
+                        mask_img_logps = self._get_per_token_logps(model, input_ids, attention_mask, **masked_mm)
+                    mask_img_logps = mask_img_logps[:, prompt_len - 1:]
+
+            if mask_img_logps is not None:
+                # k3 estimate of KL[pi(.|I) || pi(.|I_mask)] on the sampled tokens
+                delta = mask_img_logps - per_token_logps
+                if self.papo_kl_clipping:
+                    perception_kl = torch.exp(delta) - delta - 1
+                    perception_kl = torch.clamp(perception_kl, min=0.0, max=self.papo_kl_clip_max)
+                else:
+                    delta = delta.clamp(-20.0, 20.0)
+                    perception_kl = torch.clamp(torch.exp(delta) - delta - 1, min=-10.0, max=10.0)
+
+                # Per-token entropy terms; zero when their weight is 0
+                zeros = torch.zeros_like(per_token_logps)
+                if self.der_loss_weight1 > 0:
+                    orig_ent = orig_entropies if full_entropy else -per_token_logps
+                else:
+                    orig_ent = zeros
+                if self.der_loss_weight2 > 0:
+                    mask_ent = mask_img_entropies if full_entropy else -mask_img_logps
+                else:
+                    mask_ent = zeros
+
+                if self.papo_token_mean:
+                    # Official: mean over real completion tokens, added to the loss as scalars
+                    m = completion_mask.to(per_token_logps.dtype)
+                    n_tok = m.sum().clamp(min=1.0)
+                    kl_mean = (perception_kl * m).sum() / n_tok
+                    orig_ent_mean = (orig_ent * m).sum() / n_tok
+                    mask_ent_mean = (mask_ent * m).sum() / n_tok
+                    loss = (
+                        loss
+                        - self.perception_loss_weight * kl_mean
+                        + self.der_loss_weight1 * orig_ent_mean
+                        + self.der_loss_weight2 * mask_ent_mean
+                    )
+                else:
+                    # Original repo / TRL style: per-token tensors added to the scalar loss, then .mean()
+                    # over every position (padding included)
+                    perception_loss = self.perception_loss_weight * perception_kl
+                    der_loss = self.der_loss_weight1 * orig_ent + self.der_loss_weight2 * mask_ent
+                    loss = (loss - perception_loss + der_loss).mean()
+                    kl_mean = perception_kl.mean()
+                    orig_ent_mean = orig_ent.mean()
+                    mask_ent_mean = mask_ent.mean()
+
                 self._metrics["perception_kl"].append(
-                    self.accelerator.gather_for_metrics(perception_kl.detach().mean()).mean().item()
+                    self.accelerator.gather_for_metrics(kl_mean.detach()).mean().item()
                 )
-                self._metrics["entropy"].append(
-                    self.accelerator.gather_for_metrics(orig_entropies.detach().mean()).mean().item()
-                )
+                if self.der_loss_weight1 > 0:
+                    self._metrics["entropy"].append(
+                        self.accelerator.gather_for_metrics(orig_ent_mean.detach()).mean().item()
+                    )
+                if self.der_loss_weight2 > 0:
+                    self._metrics["masked_entropy"].append(
+                        self.accelerator.gather_for_metrics(mask_ent_mean.detach()).mean().item()
+                    )
 
         # Log clip ratio (only meaningful when clipping is actually applied)
         if self.loss_type not in ("sapo", "gspo"):
@@ -1308,6 +1422,26 @@ class VLMGRPOTrainer(Trainer):
             self._metrics["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
 
         return loss
+
+    def _blacken_raw_image(self, img):
+        """Official PAPO masking (random_patch_blackening): split the raw image into
+        papo_mask_patch_size x papo_mask_patch_size blocks and set each to black with probability mask_ratio.
+
+        The RNG is seeded from the image content and the current step, so every rollout of the same prompt
+        (spread across processes by RepeatRandomSampler) gets the same mask, while each step draws a new one.
+        """
+        import hashlib
+        import numpy as np
+
+        arr = np.array(img.convert("RGB"))
+        digest = hashlib.md5(arr.tobytes() + str(arr.shape).encode() + f"|{self._step}".encode()).digest()
+        rng = np.random.default_rng(int.from_bytes(digest[:8], "little"))
+        p = max(1, int(self.papo_mask_patch_size))
+        h, w = arr.shape[:2]
+        blocks = rng.random(((h + p - 1) // p, (w + p - 1) // p)) < self.mask_ratio
+        pixel_mask = np.repeat(np.repeat(blocks, p, axis=0), p, axis=1)[:h, :w]
+        arr[pixel_mask] = 0
+        return PIL.Image.fromarray(arr)
 
     def _mask_image(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Apply masking to image pixel values for PAPO's perception loss."""

@@ -398,7 +398,10 @@ class GRPOConfig(TrainingArguments):
     )
     mask_ratio: float = field(
         default=0.3,
-        metadata={"help": "Fraction of image pixels/patches to mask when computing PAPO's perception loss."},
+        metadata={
+            "help": "Fraction of image pixels/patches to mask when computing PAPO's perception loss. With "
+            "papo_mask_raw_image it is the per-block blackening probability (official: 0.6)."
+        },
     )
     mask_type: str = field(
         default="random",
@@ -417,6 +420,54 @@ class GRPOConfig(TrainingArguments):
         metadata={
             "help": "PAPO DER weight on entropies from the MASKED image forward. Active only when "
             "perception_loss_weight > 0."
+        },
+    )
+
+    # PAPO fidelity switches. Defaults keep the original (TRL-style) behaviour of this repo; setting each one
+    # to its non-default value switches that piece to the official PAPO implementation (MikeWangWZHL/PAPO).
+    papo_mask_raw_image: bool = field(
+        default=False,
+        metadata={
+            "help": "Official masking: blacken (fill 0) square blocks of the raw PIL image before the processor, "
+            "each block with probability `mask_ratio` (official uses 0.6). The mask is seeded per image and step, so "
+            "all rollouts of a prompt share one mask. False: zero random values of the processed `pixel_values`."
+        },
+    )
+    papo_mask_patch_size: int = field(
+        default=14,
+        metadata={"help": "Block size in pixels for `papo_mask_raw_image` (official: 14)."},
+    )
+    papo_precompute_mask_logps: bool = field(
+        default=False,
+        metadata={
+            "help": "Official: compute masked-image log-probs (and entropies) once per generation step without "
+            "gradients, like old_per_token_logps. False: recompute them with gradients in every loss call."
+        },
+    )
+    papo_kl_clipping: bool = field(
+        default=True,
+        metadata={
+            "help": "True: clamp the per-token perception KL to [0, papo_kl_clip_max] (tokens above get no "
+            "gradient). False (official default): only clamp for numerical safety (log-ratio to +-20, KL to +-10)."
+        },
+    )
+    papo_kl_clip_max: float = field(
+        default=0.2,
+        metadata={"help": "Upper clamp for the perception KL when `papo_kl_clipping` is True."},
+    )
+    papo_token_mean: bool = field(
+        default=False,
+        metadata={
+            "help": "Official: average the perception KL and entropy terms over real completion tokens "
+            "(completion_mask) and add them to the loss as scalars. False: add the per-token tensors to the "
+            "scalar loss and take .mean() over all positions, padding included."
+        },
+    )
+    papo_entropy_estimator: str = field(
+        default="full",
+        metadata={
+            "help": "'full': exact entropy over the vocabulary. 'sampled' (official): -log p of the sampled token, "
+            "averaged; cheaper and needs no full-vocab softmax."
         },
     )
 
