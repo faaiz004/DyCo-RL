@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import re
 import textwrap
 from collections import defaultdict
 from contextlib import nullcontext
@@ -419,6 +420,10 @@ class VLMGRPOTrainer(Trainer):
         if self.papo_entropy_estimator not in ("full", "sampled"):
             raise ValueError(f"papo_entropy_estimator must be 'full' or 'sampled', got {self.papo_entropy_estimator!r}")
 
+        # VES-RFT knobs (two-pass rollout: with image / without image -> entropy reward)
+        self.ves_rft = getattr(args, "ves_rft", False)
+        self.ves_entropy_reward_weight = getattr(args, "ves_entropy_reward_weight", 1.0)
+
         # Multi-step
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
         # Tracks the number of iterations (forward + backward passes), including those within a gradient accumulation cycle
@@ -632,6 +637,38 @@ class VLMGRPOTrainer(Trainer):
         probs = log_probs.exp()
         entropies = -(probs * log_probs).sum(dim=-1)
         return per_token_logps, entropies
+
+    @torch.no_grad()
+    def _get_per_token_entropies(self, model, input_ids, attention_mask, **custom_multimodal_inputs):
+        """Full-vocab entropy of the next-token distribution at every position, shape (B, L-1). No grad."""
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, **custom_multimodal_inputs).logits[:, :-1, :]
+        entropies = []
+        for logits_row in logits:  # row loop keeps the (L, V) float32 peak to one sample
+            log_probs = logits_row.float().log_softmax(dim=-1)
+            entropies.append(-(log_probs.exp() * log_probs).sum(dim=-1))
+        return torch.stack(entropies)
+
+    _VISION_BLOCK_RE = re.compile(r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>")
+
+    def _build_text_only_inputs(self, prompts_text, completion_ids, completion_mask):
+        """Inputs for the 'without image' VES pass: the vision block is removed from the (unexpanded) prompt text,
+        the prompt is re-tokenized as pure text and the sampled completion is appended unchanged.
+        Returns (input_ids, attention_mask, prompt_length) for this text-only sequence."""
+        text_only_prompts = [self._VISION_BLOCK_RE.sub("", t) for t in prompts_text]
+        text_inputs, _ = self.vlm_module.prepare_model_inputs(
+            self.processing_class,
+            text_only_prompts,
+            [],
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            add_special_tokens=False,
+        )
+        text_prompt_ids = text_inputs["input_ids"].to(completion_ids.device)
+        text_prompt_mask = text_inputs["attention_mask"].to(completion_ids.device)
+        input_ids = torch.cat([text_prompt_ids, completion_ids], dim=1)
+        attention_mask = torch.cat([text_prompt_mask, completion_mask.to(text_prompt_mask.dtype)], dim=1)
+        return input_ids, attention_mask, text_prompt_ids.size(1)
 
     def _prepare_inputs(self, inputs):
         # Simple pass-through, just like original
@@ -856,7 +893,37 @@ class VLMGRPOTrainer(Trainer):
         # Compute the rewards
         # No need to duplicate prompts as we're not generating multiple completions per prompt
 
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        # VES-RFT: two teacher-forced passes over the sampled response (with image / text-only prompt).
+        # R_ves = max(0, mean_t [ H_noimg(t) - H_img(t) ])  (how much the image reduces uncertainty)
+        ves_entropy_reward = None
+        if self.ves_rft:
+            if multimodal_inputs.get("pixel_values") is None:
+                raise ValueError("ves_rft requires image inputs")
+            with torch.no_grad():
+                # pass 1 (cached): with image
+                img_entropies = self._get_per_token_entropies(
+                    model, prompt_completion_ids, attention_mask, **multimodal_inputs
+                )[:, prompt_length - 1:]
+                # pass 2: same completion, text-only prompt (vision block removed, no pixel_values)
+                text_ids, text_mask, text_prompt_length = self._build_text_only_inputs(
+                    papo_prompts_text, completion_ids, completion_mask
+                )
+                noimg_entropies = self._get_per_token_entropies(model, text_ids, text_mask)[:, text_prompt_length - 1:]
+                del text_ids, text_mask
+                m = completion_mask.to(img_entropies.dtype)
+                denom = m.sum(dim=1).clamp(min=1)
+                # R_ves = max(0, mean_t [ H_noimg(t) - H_img(t) ])
+                ves_entropy_reward = (((noimg_entropies - img_entropies) * m).sum(dim=1) / denom).clamp(min=0.0).to(device)
+                self._metrics["ves/entropy_with_image"].append(
+                    self.accelerator.gather_for_metrics(((img_entropies * m).sum(1) / denom)).mean().item()
+                )
+                self._metrics["ves/entropy_without_image"].append(
+                    self.accelerator.gather_for_metrics(((noimg_entropies * m).sum(1) / denom)).mean().item()
+                )
+                del img_entropies, noimg_entropies
+
+        n_reward_cols = len(self.reward_funcs) + (1 if self.ves_rft else 0)
+        rewards_per_func = torch.zeros(len(prompts), n_reward_cols, device=device)
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
@@ -882,6 +949,9 @@ class VLMGRPOTrainer(Trainer):
                         reward_kwargs[key].extend([example[key]])
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        if ves_entropy_reward is not None:
+            rewards_per_func[:, -1] = self.ves_entropy_reward_weight * ves_entropy_reward
 
         # Gather rewards across processes
         rewards_per_func = self.accelerator.gather(rewards_per_func)
@@ -918,6 +988,9 @@ class VLMGRPOTrainer(Trainer):
             else:
                 reward_func_name = reward_func.__name__
             self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
+
+        if self.ves_rft:
+            self._metrics["rewards/ves_entropy"].append(reward_per_func[-1].item())
 
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
 

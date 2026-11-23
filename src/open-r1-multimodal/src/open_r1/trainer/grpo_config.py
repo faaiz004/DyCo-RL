@@ -487,3 +487,17 @@ class GRPOConfig(TrainingArguments):
             "help": "Apply DyCo-RL sample-score reweighting to GRPO advantages."
         },
     )
+
+    # Parameters that control whether ves_rft is enabled
+    ves_rft: bool = field(
+        default=False,
+        metadata={
+            "help": "Apply VES-RFT Training Regime"
+        },
+    )
+    ves_entropy_reward_weight: float = field(
+        default=1.0,
+        metadata={
+            "help": "Weight of the VES-RFT entropy reward (mean over response tokens of H_no_image - H_with_image)."
+        },
+    )
