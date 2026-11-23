@@ -639,13 +639,17 @@ class VLMGRPOTrainer(Trainer):
         return per_token_logps, entropies
 
     @torch.no_grad()
-    def _get_per_token_entropies(self, model, input_ids, attention_mask, **custom_multimodal_inputs):
-        """Full-vocab entropy of the next-token distribution at every position, shape (B, L-1). No grad."""
-        logits = model(input_ids=input_ids, attention_mask=attention_mask, **custom_multimodal_inputs).logits[:, :-1, :]
+    def _get_per_token_entropies(self, model, input_ids, attention_mask, start, **custom_multimodal_inputs):
+        """Full-vocab entropy of the next-token distribution for the completion positions only, shape (B, L-start).
+        `start` is the prompt length: logits[start-1] predicts the first completion token. Slicing to the completion
+        before the float32 upcast keeps prompt (incl. image) positions out of the (L, V) float32 temporaries."""
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, **custom_multimodal_inputs).logits
+        logits = logits[:, start - 1:-1, :]
         entropies = []
-        for logits_row in logits:  # row loop keeps the (L, V) float32 peak to one sample
+        for logits_row in logits:  # row loop keeps the (C, V) float32 peak to one sample
             log_probs = logits_row.float().log_softmax(dim=-1)
             entropies.append(-(log_probs.exp() * log_probs).sum(dim=-1))
+            del log_probs
         return torch.stack(entropies)
 
     _VISION_BLOCK_RE = re.compile(r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>")
@@ -900,15 +904,16 @@ class VLMGRPOTrainer(Trainer):
             if multimodal_inputs.get("pixel_values") is None:
                 raise ValueError("ves_rft requires image inputs")
             with torch.no_grad():
-                # pass 1 (cached): with image
+                # pass 1: extra teacher-forced forward with the image (not cached from generate: HF generate here
+                # returns only ids, and vLLM exposes no full-vocab distribution)
                 img_entropies = self._get_per_token_entropies(
-                    model, prompt_completion_ids, attention_mask, **multimodal_inputs
-                )[:, prompt_length - 1:]
+                    model, prompt_completion_ids, attention_mask, prompt_length, **multimodal_inputs
+                )
                 # pass 2: same completion, text-only prompt (vision block removed, no pixel_values)
                 text_ids, text_mask, text_prompt_length = self._build_text_only_inputs(
                     papo_prompts_text, completion_ids, completion_mask
                 )
-                noimg_entropies = self._get_per_token_entropies(model, text_ids, text_mask)[:, text_prompt_length - 1:]
+                noimg_entropies = self._get_per_token_entropies(model, text_ids, text_mask, text_prompt_length)
                 del text_ids, text_mask
                 m = completion_mask.to(img_entropies.dtype)
                 denom = m.sum(dim=1).clamp(min=1)
